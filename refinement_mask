@@ -1,0 +1,133 @@
+import cv2
+import numpy as np
+from collections import deque
+
+
+def refine_mask(image: np.ndarray, mask0: np.ndarray) -> np.ndarray:
+    """
+    Refine a YOLO-derived PV panel mask to recover the full cell area
+    while excluding the aluminum frame.
+
+    image : original BGR image
+    mask0 : binary mask from YOLO polygon (0 or 255)
+
+    returns: refined binary mask (0 or 255)
+    """
+
+# ROI extraction
+    ys, xs = np.where(mask0 > 0)
+    if len(xs) == 0:
+        raise ValueError("mask0 is empty")
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+
+    H, W = image.shape[:2]
+    pad = int(0.03 * max(x1 - x0, y1 - y0))  # ~3% padding
+
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(W - 1, x1 + pad)
+    y1 = min(H - 1, y1 + pad)
+
+    roi = image[y0:y1, x0:x1]
+    roi_mask0 = (mask0[y0:y1, x0:x1] > 0).astype(np.uint8)
+    h, w = roi.shape[:2]
+
+# CLAHE on L channel
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2Lab)
+    L, A, B = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L = clahe.apply(L)
+
+    lab = cv2.merge((L, A, B))
+
+
+# Color model learning
+    core_kernel = np.ones((15, 15), np.uint8)
+    core = cv2.erode(roi_mask0, core_kernel)
+
+    samples = lab[core > 0]
+    if samples.shape[0] < 100:
+        raise ValueError("Not enough pixels to learn color model")
+
+    mean_ab = samples[:, 1:].mean(axis=0)
+    std_ab = samples[:, 1:].std(axis=0) + 1e-6
+
+# Region growing
+    seed_kernel = np.ones((5, 5), np.uint8)
+    seeds = cv2.erode(roi_mask0, seed_kernel)
+
+    mask_grow = np.zeros((h, w), dtype=np.uint8)
+    visited = np.zeros((h, w), dtype=np.uint8)
+
+    queue = deque()
+    ys, xs = np.where(seeds > 0)
+    for y, x in zip(ys, xs):
+        queue.append((x, y))
+        mask_grow[y, x] = 255
+        visited[y, x] = 1
+
+    tau = 5.0  # robust for outdoor conditions
+
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    while queue:
+        px, py = queue.popleft()
+
+        for dx, dy in directions:
+            nx, ny = px + dx, py + dy
+            if 0 <= nx < w and 0 <= ny < h and not visited[ny, nx]:
+                ab = lab[ny, nx, 1:].astype(np.float32)
+                dist = np.linalg.norm((ab - mean_ab) / std_ab)
+
+                if dist <= tau:
+                    mask_grow[ny, nx] = 255
+                    queue.append((nx, ny))
+
+                visited[ny, nx] = 1
+
+
+# Remove border regions
+    border = int(0.025 * min(h, w))  # ~2.5%
+    mask_grow[:border, :] = 0
+    mask_grow[-border:, :] = 0
+    mask_grow[:, :border] = 0
+    mask_grow[:, -border:] = 0
+
+
+# Morphological cleaning
+    kernel = np.ones((3, 3), np.uint8)
+    mask_clean = cv2.morphologyEx(mask_grow, cv2.MORPH_OPEN, kernel)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_clean, 8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask_clean = (labels == largest).astype(np.uint8) * 255
+
+
+
+# Place refined mask back into full image size
+    mask_refined = np.zeros(mask0.shape, dtype=np.uint8)
+    mask_refined[y0:y1, x0:x1] = mask_clean
+
+    return mask_refined
+
+# Output
+if __name__ == "__main__":
+    img = cv2.imread("data/images/M1.JPG")
+    mask0 = cv2.imread("data/masks/M1_mask0_cls0.png", cv2.IMREAD_GRAYSCALE)
+
+    if img is None or mask0 is None:
+        raise FileNotFoundError("Image or mask could not be loaded")
+
+    refined = refine_mask(img, mask0)
+
+    overlay = img.copy()
+    overlay[refined == 255] = (0, 255, 0)
+    vis = cv2.addWeighted(img, 0.85, overlay, 0.15, 0)
+
+    cv2.imwrite("outputs/M1_refined_mask.png", refined)
+    cv2.imwrite("outputs/M1_overlay.png", vis)
+    
